@@ -2,7 +2,9 @@
 
 # Overview:
 
-A Python repo for the main functions on the Aave protocol using web3.py. 
+A Python repo for the main functions on the Aave protocol using web3.py. Forked from https://github.com/PathX-Projects/Aave-DeFi-Client.
+- Added the Polygon Mumbai Testnet
+- Added dynamic functions to easily change the amount, asset, and network
 
 ## Setup
 
@@ -25,4 +27,4 @@ MAINNET_RPC_URL: Same as above, but for mainnet.
 
 ## Thanks
 
-(MANY THANKS TO https://github.com/PathX-Projects/Aave-DeFi-Client for a lot of the basis for this code !!!)
+(MANY THANKS TO PathX-Projects for a lot of the basis for this code !!!)
