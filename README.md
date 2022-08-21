@@ -1,23 +1,21 @@
-# Aave DeFi Client for Web3.py
-
-> NOTE: This is the beta version of the client. More docs to come...
+# Aave Functions for Web3.py
 
 # Overview:
 
-The Aave DeFi Client is a Python wrapper for the core functionality on the Aave DeFi lending protocol built using only two 3rd party packages, web3 and requests. The current supported functions are [`withdraw()`](https://docs.aave.com/developers/v/2.0/the-core-protocol/lendingpool#withdraw), [`deposit()`](https://docs.aave.com/developers/v/2.0/the-core-protocol/lendingpool#deposit), [`borrow()`](https://docs.aave.com/developers/v/2.0/the-core-protocol/lendingpool#borrow), and [`repay()`](https://docs.aave.com/developers/v/2.0/the-core-protocol/lendingpool#repay).
+A Python repo for the main functions on the Aave protocol using web3.py. 
 
 ## Setup
 
-Please install or have installed the following:
+You'll need python installed.
 
-1. Install the pip package requirements from the `requirements.txt` file
-2. Make sure that you have a working RPC url for your target network. Currently the client supports the Ethereum Kovan Testnet and Mainnet. If you do not have an RPC url, you can use [Infuria.io](https://infura.io/) 
+pip install -r requirements.txt
 
-## Important Repository Information:
-- The only dependencies for usage of the aave_client are the package requirements (in [`requirements.txt`](https://github.com/PathX-Projects/Aave-DeFi-Client/blob/main/requirements.txt)), and the [`aave_client.py`](https://github.com/PathX-Projects/Aave-DeFi-Client/blob/main/aave_client.py) file.
-- You can find examples of the client's functionality in the [`usage_examples`](https://github.com/PathX-Projects/Aave-DeFi-Client/tree/main/usage_examples) directory.
-- You can safely move the [`aave_client.py`](https://github.com/PathX-Projects/Aave-DeFi-Client/blob/main/aave_client.py) file to different directories and use it with no issues, as long as the package requirements are satisfied.
+You'll need the following environment variables. You can set them all in your .env file (as strings):
+MY_ADDRESS: Your Wallet Address
+PRIVATE_KEY: Your Private Key from your Wallet # Remember to start it with "0x"
+KOVAN_RPC_URL: Your Kovan connection to the blockchain. You can get a URL from a service like Infura or ]Alchemy. An example would be https://kovan.infura.io/v3/fffffffffffffffffffff
+MUMBAI_RPC_URL: Your Mumbai connection to the blockchain. You can get a URL from a service like Infura or ]Alchemy. An example would be https://polygon-mumbai.infura.io/v3/fffffffffffffffffffff
+MAINNET_RPC_URL: Same as above, but for mainnet.
 
-## How to Get Kovan Testnet WETH:
-1. Enter your public wallet address at [ethdrop.dev](https://ethdrop.dev/) and get ETH
-2. Use the [`usage_examples/get_kovan_weth.py`](https://github.com/PathX-Projects/Aave-DeFi-Client/blob/main/usage_examples/get_kovan_weth.py) script to convert your testnet ETH to ERC-20 WETH that can be deposited to Aave.
+
+(MANY THANKS TO https://github.com/PathX-Projects/Aave-DeFi-Client for a lot of the basis for this code !!!)

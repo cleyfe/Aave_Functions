@@ -13,7 +13,11 @@ import requests
 import web3.eth
 from web3 import Web3
 from web3.gas_strategies.time_based import *
+from web3.middleware import geth_poa_middleware
 from dataclasses import dataclass
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 """------------------------------ Dataclass to Reference Aave Reserve Token Attributes ------------------------------"""
@@ -52,21 +56,27 @@ class AaveTrade:
 class AaveStakingClient:
     """Fully plug-and-play AAVE staking client in Python3"""
     def __init__(self, WALLET_ADDRESS: str, PRIVATE_WALLET_KEY: str,
-                 MAINNET_RPC_URL: str = None, KOVAN_RPC_URL: str = None,
-                 GAS_STRATEGY: str = "medium"):
+                 MAINNET_RPC_URL: str = None, KOVAN_RPC_URL: str = None, 
+                 MUMBAI_RPC_URL: str = None, GAS_STRATEGY: str = "fast"):
 
         self.private_key = PRIVATE_WALLET_KEY
         self.wallet_address = Web3.toChecksumAddress(WALLET_ADDRESS)
 
-        if KOVAN_RPC_URL is None and MAINNET_RPC_URL is None:
+        if KOVAN_RPC_URL is None and MAINNET_RPC_URL is None and MUMBAI_RPC_URL is None:
             raise Exception("Missing RPC URLs for all available choices. Must use at least one network configuration.")
-        elif KOVAN_RPC_URL is not None and MAINNET_RPC_URL is not None:
-            raise Exception("Only one active network supported at a time. Please use either the Kovan or Mainnet network.")
+        elif KOVAN_RPC_URL is not None and MAINNET_RPC_URL is not None or KOVAN_RPC_URL is not None and MUMBAI_RPC_URL is not None or MUMBAI_RPC_URL is not None and MAINNET_RPC_URL is not None:
+            raise Exception("Only one active network supported at a time. Please use either Kovan, Mumbai, or Mainnet network.")
         else:
-            self.active_network = KovanConfig(KOVAN_RPC_URL) if KOVAN_RPC_URL is not None else MainnetConfig(
-                MAINNET_RPC_URL)
+            if KOVAN_RPC_URL is not None:
+                self.active_network = KovanConfig(KOVAN_RPC_URL) 
+            elif MAINNET_RPC_URL is not None:
+                self.active_network = MainnetConfig(MAINNET_RPC_URL)
+            else:
+                self.active_network = MumbaiConfig(MUMBAI_RPC_URL)
+
 
         self.w3 = self._connect()
+        self.w3.middleware_onion.inject(geth_poa_middleware, layer=0)
 
         if GAS_STRATEGY.lower() == "fast":
             """Transaction mined within 60 seconds."""
@@ -212,6 +222,14 @@ class AaveStakingClient:
         Smart Contract Reference:
             https://docs.aave.com/developers/v/2.0/the-core-protocol/lendingpool#withdraw
         """
+
+        '''
+        Uncomment the gasPrice line below to replace a stuck tx. The line below must be used in case of the 
+        "Replacement transaction underpriced" error. Once a new tx has replaced the old one, comment again the line below.
+        Alternatively, if a tx doesnt go through and last indefinitely --> set GAS_STRATEGY to 'fast' in deposit_collateral_example.py script
+        '''
+        #gasPrice = self.w3.eth.gasPrice * 1.4
+
         nonce = nonce if nonce else self.w3.eth.getTransactionCount(self.wallet_address)
         amount_in_decimal_units = self.convert_to_decimal_units(withdraw_token, withdraw_amount)
 
@@ -286,7 +304,13 @@ class AaveStakingClient:
         Smart Contract Reference:
             https://docs.aave.com/developers/v/2.0/the-core-protocol/lendingpool#deposit
         """
-
+        
+        '''
+        replace a stuck tx. The line below must be used if error "Replacement transaction underpriced"
+        if tx doesnt go through and last indefinitely --> set GAS_STRATEGY to 'fast' in deposit_collateral_example.py script
+        '''
+        gasPrice = self.w3.eth.gasPrice
+        
         nonce = nonce if nonce else self.w3.eth.getTransactionCount(self.wallet_address)
 
         amount_in_decimal_units = self.convert_to_decimal_units(deposit_token, deposit_amount)
@@ -627,6 +651,28 @@ class KovanConfig:
         except:
             raise ConnectionError("Could not fetch Aave tokenlist for the Kovan network from URL: "
                                   "https://aave.github.io/aave-addresses/kovan.json")
+
+class MumbaiConfig:
+    def __init__(self, mumbai_rpc_url: str):
+        self.net_name = "Mumbai"
+        self.chain_id = 80001
+        self.lending_pool_addresses_provider = '0x178113104fEcbcD7fF8669a0150721e231F0FD4B'
+        self.weth_token = '0x3C68CE8504087f89c640D02d133646d98e64ddd9'
+        self.wmatic = '0x9c3C9283D3e44854697Cd22D3Faa240Cfb032889'
+        self.usdc = '0xe11A86849d99F524cAC3E7A0Ec1241828e332C62'
+        # https://aave.github.io/aave-addresses/kovan.json
+        # Aave uses their own testnet tokens to ensure they are good
+        # find the most up to date in the above
+        self.rpc_url = mumbai_rpc_url
+        self.aave_tokenlist_url = "https://aave.github.io/aave-addresses/mumbai.json"
+        self.aave_tokens = [ReserveToken(**token_data) for token_data in self.fetch_aave_tokens()]
+
+    def fetch_aave_tokens(self) -> dict:
+        try:
+            return requests.get(self.aave_tokenlist_url).json()['matic']
+        except:
+            raise ConnectionError("Could not fetch Aave tokenlist for the Mumbai network from URL: "
+                                  "https://aave.github.io/aave-addresses/mumbai.json")
 
 
 class MainnetConfig:
