@@ -616,16 +616,19 @@ class ArbitrumConfig:
     def __init__(self, arbitrum_rpc_url: str):
         self.net_name = "Arbitrum"
         self.chain_id = 42161
-        self.pool_addresses_provider = '0x1c4a937d171752e1313d70fb16ae2ea02f86303e'
+        self.pool_addresses_provider = '0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb'
         self.pool_data_provider = '0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654'
         self.weth_token = '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1'
-        self.usdc_token = '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8' 
+        self.usdc_token = '0xaf88d065e77c8cC2239327C5EDb3A432268e5831' 
+        self.usdce_token = '0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8' 
         self.usdt_token = '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9'
         self.dai_token = '0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1'        
         self.rpc_url = arbitrum_rpc_url
-        self.aave_tokenlist_url = "https://aave.github.io/aave-addresses/arbitrum.json"
-        self.aave_tokens = self.fetch_aave_tokens()
+        #self.aave_tokenlist_url = "https://aave.github.io/aave-addresses/arbitrum.json"
+        #self.aave_tokens = self.fetch_aave_tokens()
 
+    '''
+    USE getAllReservesTokens instead!!!
     def fetch_aave_tokens(self) -> list:
         try:
             tokens = requests.get(self.aave_tokenlist_url).json()
@@ -634,6 +637,7 @@ class ArbitrumConfig:
             return [ReserveToken(**token_data) for token_data in tokens[network_key]]
         except Exception as e:
             raise ConnectionError(f"Could not fetch Aave tokenlist for the Polygon network from URL: {self.aave_tokenlist_url} - Error: {e}")
+    '''
 
 class ABIReference:
     """
