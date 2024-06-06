@@ -10,7 +10,9 @@ import os
 import time
 from datetime import datetime
 import requests
-from eth_utils import to_bytes
+
+from concurrent.futures import ThreadPoolExecutor
+
 '''
 outdated imports:
 import web3.eth
@@ -182,48 +184,20 @@ class AaveClient:
         except Exception as exc:
             raise Exception(f"Could not fetch the Aave lending pool smart contract - Error: {exc}")
 
-    def get_liquidity_swap_adapter(self):
-        try:
-            swap_adapter_address = self.w3.to_checksum_address(
-                self.active_network.liquidity_swap_adapter
-            )
-            swap_adapter_contract = self.w3.eth.contract(
-                address=swap_adapter_address, 
-                abi=ABIReference.liquidity_swap_adapter_abi
-            )
-            return swap_adapter_contract
-        except Exception as exc:
-            raise Exception(f"Could not fetch the liquidity swap adapter contract - Error: {exc}")
-
-    def get_token_transfer_paraswap_proxy(self):
-        try:
-            token_transfer_proxy_address = self.w3.to_checksum_address(
-                self.active_network.token_transfer_proxy
-            )
-            token_transfer_proxy_contract = self.w3.eth.contract(
-                address=token_transfer_proxy_address, 
-                abi=ABIReference.token_transfer_proxy_abi
-            )
-            return token_transfer_proxy_contract
-        except Exception as exc:
-            raise Exception(f"Could not fetch the token transfer proxy contract - Error: {exc}")
-
-
-    def approve_erc20(self, erc20_address: str, lending_pool_contract, amount_in_decimal_units: int,
-                      nonce=None) -> tuple:
+    def approve_erc20(self, erc20_address: str, spender_address: str, amount_in_decimal_units: int, nonce=None) -> tuple:
         """
         Approve the smart contract to take the tokens out of the wallet
-        For lending pool transactions, the 'lending_pool_contract' is the lending pool contract's address.
+        For lending pool transactions, the 'spender_address' is the lending pool contract's address.
 
         Returns a tuple of the following:
             (transaction hash string, approval gas cost)
         """
         nonce = nonce if nonce else self.w3.eth.get_transaction_count(self.wallet_address)
 
-        lending_pool_address = self.w3.to_checksum_address(lending_pool_contract.address)
+        spender_address = self.w3.to_checksum_address(spender_address)
         erc20_address = self.w3.to_checksum_address(erc20_address)
         erc20 = self.w3.eth.contract(address=erc20_address, abi=ABIReference.erc20_abi)
-        function_call = erc20.functions.approve(lending_pool_address, amount_in_decimal_units)
+        function_call = erc20.functions.approve(spender_address, amount_in_decimal_units)
         transaction = function_call.build_transaction(
             {
                 "chainId": self.active_network.chain_id,
@@ -237,10 +211,10 @@ class AaveClient:
         tx_hash = self.w3.eth.send_raw_transaction(signed_txn.rawTransaction)
         receipt = dict(self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=self.timeout))
 
-        print(f"Approved {amount_in_decimal_units} of {erc20_address} for contract {lending_pool_address}")
+        print(f"Approved {amount_in_decimal_units} of {erc20_address} for contract {spender_address}")
         return tx_hash.hex(), self.w3.from_wei(int(receipt['effectiveGasPrice']) * int(receipt['gasUsed']), 'ether')
 
-    def withdraw(self, withdraw_token: ReserveToken, withdraw_amount: float, lending_pool_contract,
+    def withdraw(self, withdraw_token: ReserveToken, withdraw_amount: float,
                  nonce=None) -> AaveTrade:
         """
         Withdraws the amount of the withdraw_token from Aave, and burns the corresponding aToken.
@@ -269,11 +243,13 @@ class AaveClient:
         '''
         nonce = nonce if nonce else self.w3.eth.get_transaction_count(self.wallet_address)
         amount_in_decimal_units = self.convert_to_decimal_units(withdraw_token, withdraw_amount)
+        lending_pool_contract = self.get_lending_pool()
+
 
         print(f"Approving transaction to withdraw {withdraw_amount:.{withdraw_token.decimals}f} of {withdraw_token.symbol} from Aave...")
         try:
             approval_hash, approval_gas = self.approve_erc20(erc20_address=withdraw_token.address,
-                                                             lending_pool_contract=lending_pool_contract,
+                                                             spender_address=lending_pool_contract.address,
                                                              amount_in_decimal_units=amount_in_decimal_units,
                                                              nonce=nonce)
         except Exception as exc:
@@ -316,8 +292,7 @@ class AaveClient:
 
         return self.withdraw(withdraw_token, withdraw_amount, lending_pool_contract, nonce)
 
-    def deposit(self, deposit_token: ReserveToken, deposit_amount: float,
-                lending_pool_contract, nonce=None) -> AaveTrade:
+    def deposit(self, deposit_token: ReserveToken, deposit_amount: float, nonce=None) -> AaveTrade:
         """
         Deposits the 'deposit_amount' of the 'deposit_token' to Aave collateral.
 
@@ -343,6 +318,7 @@ class AaveClient:
         if tx doesnt go through and last indefinitely --> set GAS_STRATEGY to 'fast' in deposit_collateral_example.py script
         '''
         gasPrice = self.w3.eth.gas_price
+        lending_pool_contract = self.get_lending_pool()
         
         nonce = nonce if nonce else self.w3.eth.get_transaction_count(self.wallet_address)
 
@@ -350,10 +326,11 @@ class AaveClient:
 
         print(f"Approving transaction to deposit {deposit_amount} of {deposit_token.symbol} to Aave...")
         try:
-            approval_hash, approval_gas = self.approve_erc20(erc20_address=deposit_token.address,
-                                                             lending_pool_contract=lending_pool_contract,
+            approval_hash, approval_gas = self.approve_erc20(erc20_address=self.w3.to_checksum_address(deposit_token.address),
+                                                             spender_address=self.w3.to_checksum_address(lending_pool_contract.address),
                                                              amount_in_decimal_units=amount_in_decimal_units,
                                                              nonce=nonce)
+            print("Transaction approved!")
         except Exception as exc:
             raise UserWarning(f"Could not approve deposit transaction - Error Code {exc}")
 
@@ -402,9 +379,9 @@ class AaveClient:
         except TypeError:
             raise Exception(f"Could not unpack user data due to a TypeError - Received: {user_data}")
 
-        available_borrow_base = self.w3.from_wei(available_borrow_base, "ether")
-        total_collateral_base = self.w3.from_wei(total_collateral_base, "ether")
-        total_debt_base = self.w3.from_wei(total_debt_base, "ether")
+        #available_borrow_base = self.w3.from_wei(available_borrow_base, "ether")
+        #total_collateral_base = self.w3.from_wei(total_collateral_base, "ether")
+        #total_debt_base = self.w3.from_wei(total_debt_base, "ether")
         return float(available_borrow_base), float(total_debt_base), float(total_collateral_base)
 
     def get_protocol_data(self, function_name="getAllReservesTokens", *args, **kwargs) -> tuple:
@@ -428,9 +405,21 @@ class AaveClient:
             - getReserveData(address asset): Returns the following reserve data (see docs)
             - getATokenTotalSupply(address asset)
             - getTotalDebt(address asset)
-            - getUserReserveData(address asset, address user)
+            - getUserReserveData(address asset, address user): output is described below
             - getReserveTokensAddresses(address asset)
             - getInterestRateStrategyAddress(address asset)
+
+
+            if function is getUserReserveData, output has 9 values:
+                1) The current AToken balance of the user
+                2) The current stable debt of the user
+                3) The current variable debt of the user
+                4) The principal stable debt of the user
+                5) The scaled variable debt of the user
+                6) The stable borrow rate of the user
+                7) The liquidity rate of the reserve
+                8) The timestamp of the last update of the user stable rate
+                9) True if the user is using the asset as collateral, else false
 
         https://docs.aave.com/developers/core-contracts/aaveprotocoldataprovider
         """
@@ -557,6 +546,39 @@ class AaveClient:
 
         return result
 
+    def get_wallet_balance_data(self, function_name="getReserveData", *args, **kwargs) -> dict:
+        """
+        Implements a logic of getting multiple tokens balance for one user address.
+
+        Parameters:
+        - function_name: defines the function we want to call from the contract. Possible function
+        names are:
+            - balanceOf(address user, address token): Returns the balance of the token for user (ETH included with 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE).
+            - batchBalanceOf(address[] calldata users, address[] calldata tokens): Returns balances for a list of users and tokens (ETH included with MOCK_ETH_ADDRESS).
+            - getUserWalletBalances(address provider, address user): Provides balances of user wallet for all reserves available on the pool
+            ...
+
+        https://docs.aave.com/developers/periphery-contracts/walletbalanceprovider
+        """
+        wallet_balance_provider = self.w3.to_checksum_address(self.active_network.wallet_balance_provider)
+        
+        wallet_balance_contract = self.w3.eth.contract(address=wallet_balance_provider, abi=ABIReference.wallet_balance_provide_abi)
+        
+        try:
+            # Get the function dynamically
+            contract_function = getattr(wallet_balance_contract.functions, function_name)
+            # Call the function with provided arguments
+            result = contract_function(*args, **kwargs).call()
+
+            # Handle specific case for getReserveData
+            
+        except AttributeError:
+            raise ValueError(f"Method {function_name} does not exist in the contract.")
+        except Exception as e:
+            raise Exception(f"An error occurred while calling the method {function_name}: {e}")
+
+        return result
+
     def get_asset_price(self, base_address: str, quote_address: str = None) -> float:
             """
             If quote_address is None, returns the asset price in Ether
@@ -591,7 +613,7 @@ class AaveClient:
             return float(latest_price)
 
     def borrow(self, lending_pool_contract, borrow_amount: float, borrow_asset: ReserveToken,
-            nonce=None, interest_rate_mode: str = "stable") -> AaveTrade:
+            nonce=None, interest_rate_mode: str = "variable") -> AaveTrade:
         """
         Borrows the underlying asset (erc20_address) as long as the amount is within the confines of
         the user's buying power.
@@ -613,12 +635,14 @@ class AaveClient:
         Smart Contract Docs:
         https://docs.aave.com/developers/v/2.0/the-core-protocol/lendingpool#borrow
         """
+        
+        print("Let's borrow...")
 
         rate_mode_str = interest_rate_mode
         if interest_rate_mode.lower() == "stable":
             interest_rate_mode = 1
         elif interest_rate_mode.lower() == "variable":
-            interest_rate_mode = 0
+            interest_rate_mode = 2
         else:
             raise ValueError(f"Invalid interest rate mode passed to the borrow_erc20 function ({interest_rate_mode}) - "
                             f"Valid interest rate modes are 'stable' and 'variable'")
@@ -628,16 +652,18 @@ class AaveClient:
 
         # Create and send transaction to borrow assets against collateral:
         print(f"\nCreating transaction to borrow {borrow_amount:.{borrow_asset.decimals}f} {borrow_asset.symbol}...")
-        function_call = lending_pool_contract.functions.borrow(Web3.toChecksumAddress(borrow_asset.address),
-                                                            borrow_amount_in_decimal_units,
-                                                            interest_rate_mode, 0,
-                                                            # 0 must not be changed, it is deprecated
-                                                            self.wallet_address)
-        transaction = function_call.buildTransaction(
+        function_call = lending_pool_contract.functions.borrow(
+            self.w3.to_checksum_address(borrow_asset.address),
+            borrow_amount_in_decimal_units,
+            interest_rate_mode, 0,
+            # 0 must not be changed, it is deprecated
+            self.w3.to_checksum_address(self.wallet_address))
+        
+        transaction = function_call.build_transaction(
             {
                 "chainId": self.active_network.chain_id,
                 "from": self.wallet_address,
-                "nonce": nonce if nonce else self.w3.eth.getTransactionCount(self.wallet_address),
+                "nonce": nonce if nonce else self.w3.eth.get_transaction_count(self.wallet_address),
             }
         )
         signed_txn = self.w3.eth.account.sign_transaction(
@@ -656,8 +682,12 @@ class AaveClient:
         """integer units i.e amt * 10 ^ (decimal units of the token). So, 1.2 USDC will be 1.2 * 10 ^ 6"""
         return int(token_amount * (10 ** int(reserve_token.decimals)))
 
+    def convert_from_decimal_units(self, reserve_token: ReserveToken, token_amount: float) -> int:
+        """integer units i.e amt * 10 ^ (decimal units of the token). So, 1.2 USDC will be 1.2 * 10 ^ 6"""
+        return float(token_amount / (10 ** int(reserve_token.decimals)))
+
     def borrow_percentage(self, lending_pool_contract, borrow_percentage: float,
-                        borrow_asset: ReserveToken, nonce=None, interest_rate_mode: str = "stable") -> AaveTrade:
+                        borrow_asset: ReserveToken, nonce=None, interest_rate_mode: str = "variable") -> AaveTrade:
         """Same parameters as the self.borrow() function, except instead of 'borrow_amount', you will pass the
         percentage of borrowing power that you would like to borrow from in the 'borrow_percentage' parameter in the
         following format: 0.0 (0% of borrowing power) to 1.0 (100% of borrowing power)"""
@@ -677,7 +707,7 @@ class AaveClient:
                         borrow_asset=borrow_asset, nonce=nonce, interest_rate_mode=interest_rate_mode)
 
     def repay(self, lending_pool_contract, repay_amount: float, repay_asset: ReserveToken,
-            nonce=None, interest_rate_mode: str = "stable") -> AaveTrade:
+            nonce=None, interest_rate_mode: str = "variable") -> AaveTrade:
         """
         Parameters:
             lending_pool_contract: The web3.eth.Contract object returned by the self.get_lending_pool() function.
@@ -694,7 +724,6 @@ class AaveClient:
         https://docs.aave.com/developers/v/2.0/the-core-protocol/lendingpool#repay
         """
         print("Time to repay...")
-        nonce = nonce if nonce else self.w3.eth.getTransactionCount(self.wallet_address)
 
         rate_mode_str = interest_rate_mode
         if interest_rate_mode == "stable":
@@ -707,32 +736,32 @@ class AaveClient:
         # First, attempt to approve the transaction:
         print(f"Approving transaction to repay {repay_amount} of {repay_asset.symbol} to Aave...")
         try:
-            approval_hash, approval_gas = self.approve_erc20(erc20_address=repay_asset.address,
-                                                            lending_pool_contract=lending_pool_contract,
+            approval_hash, approval_gas = self.approve_erc20(erc20_address=self.w3.to_checksum_address(repay_asset.address),
+                                                            spender_address=self.w3.to_checksum_address(lending_pool_contract.address),
                                                             amount_in_decimal_units=amount_in_decimal_units,
                                                             nonce=nonce)
             print("Transaction approved!")
         except Exception as exc:
             raise UserWarning(f"Could not approve repay transaction - Error Code {exc}")
 
-        print("Building function call...")
+        print(f"Repaying {repay_amount} of {repay_asset.symbol}...")
         function_call = lending_pool_contract.functions.repay(
-            repay_asset.address,
+            self.w3.to_checksum_address(repay_asset.address),
             amount_in_decimal_units,
             interest_rate_mode,  # the the interest rate mode
-            self.wallet_address,
+            self.w3.to_checksum_address(self.wallet_address),
         )
-        print("Building transaction from function call...")
-        transaction = function_call.buildTransaction(
+        #print("Building transaction from function call...")
+        transaction = function_call.build_transaction(
             {
                 "chainId": self.active_network.chain_id,
                 "from": self.wallet_address,
-                "nonce": nonce + 1,
+                "nonce": nonce if nonce else self.w3.eth.get_transaction_count(self.wallet_address),
             }
         )
-        print("Repaying...")
+        #print("Repaying...")
         signed_txn = self.w3.eth.account.sign_transaction(
-            transaction, self.private_key
+            transaction, private_key=self.private_key
         )
         tx_hash = self.w3.eth.send_raw_transaction(signed_txn.rawTransaction)
         receipt = self.process_transaction_receipt(tx_hash, repay_amount, repay_asset, "Repay",
@@ -806,78 +835,118 @@ class AaveClient:
         """Returns all Aave ReserveToken class objects stored on the active network"""
         return self.active_network.aave_tokens
 
-    def swap_collateral(self, swap_from_token: ReserveToken, swap_to_token: ReserveToken, amount_to_swap: float, swap_all_balance_offset: int, swap_calldata: bytes, permit_params: tuple):
-        """
-        Execute the swap and deposit operation using the ParaSwapLiquiditySwapAdapter contract.
+    def get_paraswap_prices(self, src_token, dest_token, src_amount, src_decimals, dest_decimals, network='42161'):
+        """Call ParaSwap API to get price data."""
+        url = "https://apiv5.paraswap.io/prices"
+        params = {
+            "srcToken": src_token,
+            "destToken": dest_token,
+            "srcDecimals": src_decimals,
+            "destDecimals": dest_decimals,
+            "amount": src_amount,
+            "side": "SELL",
+            "network": network,
+            "includeDEXS": "true",
+            "excludeContractMethods": "simpleSwap",
+        }
+        response = requests.get(url, params=params)
+        if response.status_code != 200:
+            raise Exception(f"ParaSwap prices API call failed: {response.text}")
 
+        return response.json()
+
+    def get_paraswap_transaction(self, prices_data, user_address):
+        """Call ParaSwap API to get transaction data."""
+        url = f"https://apiv5.paraswap.io/transactions/{prices_data['priceRoute']['network']}"
+        body = {
+            "priceRoute": prices_data['priceRoute'],
+            "srcToken": prices_data['priceRoute']['srcToken'],
+            "destToken": prices_data['priceRoute']['destToken'],
+            "srcAmount": prices_data['priceRoute']['srcAmount'],
+            "destAmount": prices_data['priceRoute']['destAmount'],
+            "userAddress": user_address,
+            "partnerAddress": user_address,
+        }
+        headers = {
+            "Content-Type": "application/json"
+        }
+        response = requests.post(url, json=body, headers=headers)
+        if response.status_code != 200:
+            raise Exception(f"ParaSwap transactions API call failed: {response.text}")
+
+        return response.json()
+
+    def swap(self, swap_from_token: ReserveToken, swap_to_token: ReserveToken, amount_to_swap: float):
+        """
+        Execute the swap operation using ParaSwap API and send transaction via web3.
+        
         Parameters:
             swap_from_token: The ReserveToken object representing the token to swap from.
             swap_to_token: The ReserveToken object representing the token to swap to.
             amount_to_swap: The amount of tokens to swap.
-            swap_all_balance_offset: Set to offset of fromAmount in Augustus calldata if wanting to swap all balance, otherwise 0.
-            swap_calldata: Calldata for ParaSwap's AugustusSwapper contract.
-            permit_params: Struct containing the permit signatures, set to all zeroes if not used.
+            min_amount_to_receive: The minimum amount to receive from the swap.
         """
         try:
-            # Approve the liquidity swap adapter contract to pull ATokens
-            swap_adapter_contract = self.get_liquidity_swap_adapter()
+            # Convert amounts to decimal units
             amount_in_decimal_units = self.convert_to_decimal_units(swap_from_token, amount_to_swap)
-            min_amount_to_receive_in_decimal_units = self.convert_to_decimal_units(swap_to_token, 0.995 * amount_to_swap)
             
+            # Approve token transfer for ParaSwap proxy only if necessary
+            erc20_address = Web3.to_checksum_address(swap_from_token.address)
+            spender_address = Web3.to_checksum_address(self.active_network.token_transfer_proxy)
+            #current_allowance = self.get_allowance(erc20_address, spender_address)
+            
+            #if current_allowance < amount_in_decimal_units:
             approval_hash, approval_gas = self.approve_erc20(
-                erc20_address=swap_from_token.aTokenAddress,
-                lending_pool_contract=swap_adapter_contract,
+                erc20_address=erc20_address,
+                spender_address=spender_address,
                 amount_in_decimal_units=amount_in_decimal_units
             )
 
-            # Convert parameters to the expected types
-            swap_all_balance_offset_uint = int(swap_all_balance_offset)
-            amount_in_decimal_units_uint = int(amount_in_decimal_units)
-            min_amount_to_receive_uint = int(min_amount_to_receive_in_decimal_units)
-            swap_calldata_bytes = to_bytes(hexstr=swap_calldata.hex())
-            permit_params_tuple = (
-                int(permit_params[0]),
-                int(permit_params[1]),
-                int(permit_params[2]),
-                to_bytes(hexstr=permit_params[3].hex()),
-                to_bytes(hexstr=permit_params[4].hex())
-            )
+            # Fetch price data and transaction data concurrently
+            #with ThreadPoolExecutor() as executor:
+            prices_data = self.get_paraswap_prices(swap_from_token.address, swap_to_token.address, amount_in_decimal_units, swap_from_token.decimals, swap_to_token.decimals)
+                #if current_allowance < amount_in_decimal_units:
+            transaction_data = self.get_paraswap_transaction(prices_data, self.wallet_address)
+                #else:
+                    #transaction_data = executor.submit(fetch_transaction, prices_data).result()
 
-            # Proceed with the swap and deposit operation
+            # Build and send the transaction
             nonce = self.w3.eth.get_transaction_count(self.wallet_address)
+            transaction = {
+                'from': transaction_data['from'],
+                'to': transaction_data['to'],
+                'value': int(transaction_data['value']),
+                'data': transaction_data['data'],
+                'gasPrice': int(transaction_data['gasPrice']),
+                'gas': int(transaction_data['gas']),
+                'chainId': int(transaction_data['chainId']),
+                'nonce': nonce
+            }
 
-            function_call = swap_adapter_contract.functions.swapAndDeposit(
-                self.w3.to_checksum_address(swap_from_token.address),
-                self.w3.to_checksum_address(swap_to_token.address),
-                amount_in_decimal_units_uint,
-                min_amount_to_receive_uint,
-                swap_all_balance_offset_uint,
-                swap_calldata_bytes,
-                self.w3.to_checksum_address(self.active_network.augustus_swapper),
-                permit_params_tuple
-            )
-
-            # Estimate gas limit
-            gas_limit = function_call.estimate_gas({
-                'from': self.wallet_address,
-            })
-
-            transaction = function_call.build_transaction({
-                'chainId': self.active_network.chain_id,
-                'from': self.wallet_address,
-                'nonce': nonce,
-                'gas': gas_limit,
-                'gasPrice': self.w3.eth.generate_gas_price(),
-            })
-
+            # Sign the transaction
             signed_txn = self.w3.eth.account.sign_transaction(transaction, private_key=self.private_key)
             tx_hash = self.w3.eth.send_raw_transaction(signed_txn.rawTransaction)
-            receipt = self.process_transaction_receipt(tx_hash, amount_to_swap, swap_from_token, operation="SwapAndDeposit", approval_gas_cost=approval_gas)
+            receipt = self.process_transaction_receipt(tx_hash, amount_to_swap, swap_from_token, operation="Swap", approval_gas_cost=approval_gas)
             
             return receipt
 
         except Exception as exc:
-            raise Exception(f"Could not execute swap and deposit - Error: {exc}")
+            raise Exception(f"Could not execute swap - Error: {exc}")
+
+    def get_allowance(self, erc20_address: str, spender_address: str) -> int:
+        """
+        Get the current allowance for a given ERC20 token and spender.
+        
+        Parameters:
+            erc20_address: The address of the ERC20 token.
+            spender_address: The address of the spender.
+        
+        Returns:
+            The current allowance as an integer.
+        """
+        erc20 = self.w3.eth.contract(address=erc20_address, abi=ABIReference.erc20_abi)
+        return erc20.functions.allowance(self.wallet_address, spender_address).call()
+
 
 '''
 OUTDATED CONFIG WITH V2 INSTEAD OF V3
@@ -992,7 +1061,7 @@ class ArbitrumConfig:
         self.chain_id = 42161
         self.pool_addresses_provider = '0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb'
         self.pool_data_provider = '0x69FA688f1Dc47d4B5d8029D5a35FB7a548310654'
-        self.wallet_balance_provider = ''
+        self.wallet_balance_provider = '0xBc790382B3686abffE4be14A030A96aC6154023a'
         self.liquidity_swap_adapter = '0xF3C3F14dd7BDb7E03e6EBc3bc5Ffc6D66De12251'
         self.collateral_repay_adapter = '0x28201C152DC5B69A86FA54FCfd21bcA4C0eff3BA'
         self.augustus_swapper = '0xDEF171Fe48CF0115B1d80b88dc8eAB59176FEe57'
@@ -1333,725 +1402,6 @@ class ABIReference:
         },{"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"oldAddress","type":"address"},{"indexed":True,"internalType":"address","name":"newAddress","type":"address"}],"name":"ACLAdminUpdated","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"oldAddress","type":"address"},{"indexed":True,"internalType":"address","name":"newAddress","type":"address"}],"name":"ACLManagerUpdated","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"bytes32","name":"id","type":"bytes32"},{"indexed":True,"internalType":"address","name":"oldAddress","type":"address"},{"indexed":True,"internalType":"address","name":"newAddress","type":"address"}],"name":"AddressSet","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"bytes32","name":"id","type":"bytes32"},{"indexed":True,"internalType":"address","name":"proxyAddress","type":"address"},{"indexed":False,"internalType":"address","name":"oldImplementationAddress","type":"address"},{"indexed":True,"internalType":"address","name":"newImplementationAddress","type":"address"}],"name":"AddressSetAsProxy","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"string","name":"oldMarketId","type":"string"},{"indexed":True,"internalType":"string","name":"newMarketId","type":"string"}],"name":"MarketIdSet","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":True,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"oldAddress","type":"address"},{"indexed":True,"internalType":"address","name":"newAddress","type":"address"}],"name":"PoolConfiguratorUpdated","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"oldAddress","type":"address"},{"indexed":True,"internalType":"address","name":"newAddress","type":"address"}],"name":"PoolDataProviderUpdated","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"oldAddress","type":"address"},{"indexed":True,"internalType":"address","name":"newAddress","type":"address"}],"name":"PoolUpdated","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"oldAddress","type":"address"},{"indexed":True,"internalType":"address","name":"newAddress","type":"address"}],"name":"PriceOracleSentinelUpdated","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"oldAddress","type":"address"},{"indexed":True,"internalType":"address","name":"newAddress","type":"address"}],"name":"PriceOracleUpdated","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"bytes32","name":"id","type":"bytes32"},{"indexed":True,"internalType":"address","name":"proxyAddress","type":"address"},{"indexed":True,"internalType":"address","name":"implementationAddress","type":"address"}],"name":"ProxyCreated","type":"event"},{"inputs":[],"name":"getACLAdmin","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"getACLManager","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"bytes32","name":"id","type":"bytes32"}],"name":"getAddress","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"getMarketId","outputs":[{"internalType":"string","name":"","type":"string"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"getPool","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"getPoolConfigurator","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"getPoolDataProvider","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"getPriceOracle","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"getPriceOracleSentinel","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newAclAdmin","type":"address"}],"name":"setACLAdmin","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newAclManager","type":"address"}],"name":"setACLManager","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes32","name":"id","type":"bytes32"},{"internalType":"address","name":"newAddress","type":"address"}],"name":"setAddress","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"bytes32","name":"id","type":"bytes32"},{"internalType":"address","name":"newImplementationAddress","type":"address"}],"name":"setAddressAsProxy","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"string","name":"newMarketId","type":"string"}],"name":"setMarketId","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newPoolConfiguratorImpl","type":"address"}],"name":"setPoolConfiguratorImpl","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newDataProvider","type":"address"}],"name":"setPoolDataProvider","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newPoolImpl","type":"address"}],"name":"setPoolImpl","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newPriceOracle","type":"address"}],"name":"setPriceOracle","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newPriceOracleSentinel","type":"address"}],"name":"setPriceOracleSentinel","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"}
         ]
 
-    lending_pool_abi = [
-        {
-            "anonymous": False,
-            "inputs": [
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "reserve",
-                    "type": "address",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "address",
-                    "name": "user",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "onBehalfOf",
-                    "type": "address",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "amount",
-                    "type": "uint256",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "borrowRateMode",
-                    "type": "uint256",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "borrowRate",
-                    "type": "uint256",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "uint16",
-                    "name": "referral",
-                    "type": "uint16",
-                },
-            ],
-            "name": "Borrow",
-            "type": "event",
-        },
-        {
-            "anonymous": False,
-            "inputs": [
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "reserve",
-                    "type": "address",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "address",
-                    "name": "user",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "onBehalfOf",
-                    "type": "address",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "amount",
-                    "type": "uint256",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "uint16",
-                    "name": "referral",
-                    "type": "uint16",
-                },
-            ],
-            "name": "Deposit",
-            "type": "event",
-        },
-        {
-            "anonymous": False,
-            "inputs": [
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "target",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "initiator",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "asset",
-                    "type": "address",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "amount",
-                    "type": "uint256",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "premium",
-                    "type": "uint256",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint16",
-                    "name": "referralCode",
-                    "type": "uint16",
-                },
-            ],
-            "name": "FlashLoan",
-            "type": "event",
-        },
-        {
-            "anonymous": False,
-            "inputs": [
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "collateralAsset",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "debtAsset",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "user",
-                    "type": "address",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "debtToCover",
-                    "type": "uint256",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "liquidatedCollateralAmount",
-                    "type": "uint256",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "address",
-                    "name": "liquidator",
-                    "type": "address",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "bool",
-                    "name": "receiveAToken",
-                    "type": "bool",
-                },
-            ],
-            "name": "LiquidationCall",
-            "type": "event",
-        },
-        {"anonymous": False, "inputs": [], "name": "Paused", "type": "event"},
-        {
-            "anonymous": False,
-            "inputs": [
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "reserve",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "user",
-                    "type": "address",
-                },
-            ],
-            "name": "RebalanceStableBorrowRate",
-            "type": "event",
-        },
-        {
-            "anonymous": False,
-            "inputs": [
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "reserve",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "user",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "repayer",
-                    "type": "address",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "amount",
-                    "type": "uint256",
-                },
-            ],
-            "name": "Repay",
-            "type": "event",
-        },
-        {
-            "anonymous": False,
-            "inputs": [
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "reserve",
-                    "type": "address",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "liquidityRate",
-                    "type": "uint256",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "stableBorrowRate",
-                    "type": "uint256",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "variableBorrowRate",
-                    "type": "uint256",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "liquidityIndex",
-                    "type": "uint256",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "variableBorrowIndex",
-                    "type": "uint256",
-                },
-            ],
-            "name": "ReserveDataUpdated",
-            "type": "event",
-        },
-        {
-            "anonymous": False,
-            "inputs": [
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "reserve",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "user",
-                    "type": "address",
-                },
-            ],
-            "name": "ReserveUsedAsCollateralDisabled",
-            "type": "event",
-        },
-        {
-            "anonymous": False,
-            "inputs": [
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "reserve",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "user",
-                    "type": "address",
-                },
-            ],
-            "name": "ReserveUsedAsCollateralEnabled",
-            "type": "event",
-        },
-        {
-            "anonymous": False,
-            "inputs": [
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "reserve",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "user",
-                    "type": "address",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "rateMode",
-                    "type": "uint256",
-                },
-            ],
-            "name": "Swap",
-            "type": "event",
-        },
-        {"anonymous": False, "inputs": [], "name": "Unpaused", "type": "event"},
-        {
-            "anonymous": False,
-            "inputs": [
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "reserve",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "user",
-                    "type": "address",
-                },
-                {
-                    "indexed": True,
-                    "internalType": "address",
-                    "name": "to",
-                    "type": "address",
-                },
-                {
-                    "indexed": False,
-                    "internalType": "uint256",
-                    "name": "amount",
-                    "type": "uint256",
-                },
-            ],
-            "name": "Withdraw",
-            "type": "event",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "asset", "type": "address"},
-                {"internalType": "uint256", "name": "amount", "type": "uint256"},
-                {"internalType": "uint256", "name": "interestRateMode", "type": "uint256"},
-                {"internalType": "uint16", "name": "referralCode", "type": "uint16"},
-                {"internalType": "address", "name": "onBehalfOf", "type": "address"},
-            ],
-            "name": "borrow",
-            "outputs": [],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "asset", "type": "address"},
-                {"internalType": "uint256", "name": "amount", "type": "uint256"},
-                {"internalType": "address", "name": "onBehalfOf", "type": "address"},
-                {"internalType": "uint16", "name": "referralCode", "type": "uint16"},
-            ],
-            "name": "deposit",
-            "outputs": [],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "asset", "type": "address"},
-                {"internalType": "address", "name": "from", "type": "address"},
-                {"internalType": "address", "name": "to", "type": "address"},
-                {"internalType": "uint256", "name": "amount", "type": "uint256"},
-                {"internalType": "uint256", "name": "balanceFromAfter", "type": "uint256"},
-                {"internalType": "uint256", "name": "balanceToBefore", "type": "uint256"},
-            ],
-            "name": "finalizeTransfer",
-            "outputs": [],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "receiverAddress", "type": "address"},
-                {"internalType": "address[]", "name": "assets", "type": "address[]"},
-                {"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"},
-                {"internalType": "uint256[]", "name": "modes", "type": "uint256[]"},
-                {"internalType": "address", "name": "onBehalfOf", "type": "address"},
-                {"internalType": "bytes", "name": "params", "type": "bytes"},
-                {"internalType": "uint16", "name": "referralCode", "type": "uint16"},
-            ],
-            "name": "flashLoan",
-            "outputs": [],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [],
-            "name": "getAddressesProvider",
-            "outputs": [
-                {
-                    "internalType": "contract ILendingPoolAddressesProvider",
-                    "name": "",
-                    "type": "address",
-                }
-            ],
-            "stateMutability": "view",
-            "type": "function",
-        },
-        {
-            "inputs": [{"internalType": "address", "name": "asset", "type": "address"}],
-            "name": "getConfiguration",
-            "outputs": [
-                {
-                    "components": [
-                        {"internalType": "uint256", "name": "data", "type": "uint256"}
-                    ],
-                    "internalType": "struct DataTypes.ReserveConfigurationMap",
-                    "name": "",
-                    "type": "tuple",
-                }
-            ],
-            "stateMutability": "view",
-            "type": "function",
-        },
-        {
-            "inputs": [{"internalType": "address", "name": "asset", "type": "address"}],
-            "name": "getReserveData",
-            "outputs": [
-                {
-                    "components": [
-                        {
-                            "components": [
-                                {
-                                    "internalType": "uint256",
-                                    "name": "data",
-                                    "type": "uint256",
-                                }
-                            ],
-                            "internalType": "struct DataTypes.ReserveConfigurationMap",
-                            "name": "configuration",
-                            "type": "tuple",
-                        },
-                        {
-                            "internalType": "uint128",
-                            "name": "liquidityIndex",
-                            "type": "uint128",
-                        },
-                        {
-                            "internalType": "uint128",
-                            "name": "variableBorrowIndex",
-                            "type": "uint128",
-                        },
-                        {
-                            "internalType": "uint128",
-                            "name": "currentLiquidityRate",
-                            "type": "uint128",
-                        },
-                        {
-                            "internalType": "uint128",
-                            "name": "currentVariableBorrowRate",
-                            "type": "uint128",
-                        },
-                        {
-                            "internalType": "uint128",
-                            "name": "currentStableBorrowRate",
-                            "type": "uint128",
-                        },
-                        {
-                            "internalType": "uint40",
-                            "name": "lastUpdateTimestamp",
-                            "type": "uint40",
-                        },
-                        {
-                            "internalType": "address",
-                            "name": "aTokenAddress",
-                            "type": "address",
-                        },
-                        {
-                            "internalType": "address",
-                            "name": "stableDebtTokenAddress",
-                            "type": "address",
-                        },
-                        {
-                            "internalType": "address",
-                            "name": "variableDebtTokenAddress",
-                            "type": "address",
-                        },
-                        {
-                            "internalType": "address",
-                            "name": "interestRateStrategyAddress",
-                            "type": "address",
-                        },
-                        {"internalType": "uint8", "name": "id", "type": "uint8"},
-                    ],
-                    "internalType": "struct DataTypes.ReserveData",
-                    "name": "",
-                    "type": "tuple",
-                }
-            ],
-            "stateMutability": "view",
-            "type": "function",
-        },
-        {
-            "inputs": [{"internalType": "address", "name": "asset", "type": "address"}],
-            "name": "getReserveNormalizedIncome",
-            "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-            "stateMutability": "view",
-            "type": "function",
-        },
-        {
-            "inputs": [{"internalType": "address", "name": "asset", "type": "address"}],
-            "name": "getReserveNormalizedVariableDebt",
-            "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-            "stateMutability": "view",
-            "type": "function",
-        },
-        {
-            "inputs": [],
-            "name": "getReservesList",
-            "outputs": [{"internalType": "address[]", "name": "", "type": "address[]"}],
-            "stateMutability": "view",
-            "type": "function",
-        },
-        {
-            "inputs": [{"internalType": "address", "name": "user", "type": "address"}],
-            "name": "getUserAccountData",
-            "outputs": [
-                {
-                    "internalType": "uint256",
-                    "name": "totalCollateralETH",
-                    "type": "uint256",
-                },
-                {"internalType": "uint256", "name": "totalDebtETH", "type": "uint256"},
-                {
-                    "internalType": "uint256",
-                    "name": "availableBorrowsETH",
-                    "type": "uint256",
-                },
-                {
-                    "internalType": "uint256",
-                    "name": "currentLiquidationThreshold",
-                    "type": "uint256",
-                },
-                {"internalType": "uint256", "name": "ltv", "type": "uint256"},
-                {"internalType": "uint256", "name": "healthFactor", "type": "uint256"},
-            ],
-            "stateMutability": "view",
-            "type": "function",
-        },
-        {
-            "inputs": [{"internalType": "address", "name": "user", "type": "address"}],
-            "name": "getUserConfiguration",
-            "outputs": [
-                {
-                    "components": [
-                        {"internalType": "uint256", "name": "data", "type": "uint256"}
-                    ],
-                    "internalType": "struct DataTypes.UserConfigurationMap",
-                    "name": "",
-                    "type": "tuple",
-                }
-            ],
-            "stateMutability": "view",
-            "type": "function",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "reserve", "type": "address"},
-                {"internalType": "address", "name": "aTokenAddress", "type": "address"},
-                {"internalType": "address", "name": "stableDebtAddress", "type": "address"},
-                {
-                    "internalType": "address",
-                    "name": "variableDebtAddress",
-                    "type": "address",
-                },
-                {
-                    "internalType": "address",
-                    "name": "interestRateStrategyAddress",
-                    "type": "address",
-                },
-            ],
-            "name": "initReserve",
-            "outputs": [],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "collateralAsset", "type": "address"},
-                {"internalType": "address", "name": "debtAsset", "type": "address"},
-                {"internalType": "address", "name": "user", "type": "address"},
-                {"internalType": "uint256", "name": "debtToCover", "type": "uint256"},
-                {"internalType": "bool", "name": "receiveAToken", "type": "bool"},
-            ],
-            "name": "liquidationCall",
-            "outputs": [],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [],
-            "name": "paused",
-            "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
-            "stateMutability": "view",
-            "type": "function",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "asset", "type": "address"},
-                {"internalType": "address", "name": "user", "type": "address"},
-            ],
-            "name": "rebalanceStableBorrowRate",
-            "outputs": [],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "asset", "type": "address"},
-                {"internalType": "uint256", "name": "amount", "type": "uint256"},
-                {"internalType": "uint256", "name": "rateMode", "type": "uint256"},
-                {"internalType": "address", "name": "onBehalfOf", "type": "address"},
-            ],
-            "name": "repay",
-            "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "reserve", "type": "address"},
-                {"internalType": "uint256", "name": "configuration", "type": "uint256"},
-            ],
-            "name": "setConfiguration",
-            "outputs": [],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [{"internalType": "bool", "name": "val", "type": "bool"}],
-            "name": "setPause",
-            "outputs": [],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "reserve", "type": "address"},
-                {
-                    "internalType": "address",
-                    "name": "rateStrategyAddress",
-                    "type": "address",
-                },
-            ],
-            "name": "setReserveInterestRateStrategyAddress",
-            "outputs": [],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "asset", "type": "address"},
-                {"internalType": "bool", "name": "useAsCollateral", "type": "bool"},
-            ],
-            "name": "setUserUseReserveAsCollateral",
-            "outputs": [],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "asset", "type": "address"},
-                {"internalType": "uint256", "name": "rateMode", "type": "uint256"},
-            ],
-            "name": "swapBorrowRateMode",
-            "outputs": [],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-        {
-            "inputs": [
-                {"internalType": "address", "name": "asset", "type": "address"},
-                {"internalType": "uint256", "name": "amount", "type": "uint256"},
-                {"internalType": "address", "name": "to", "type": "address"},
-            ],
-            "name": "withdraw",
-            "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-            "stateMutability": "nonpayable",
-            "type": "function",
-        },
-    ]
-
     aave_price_oracle_abi = [
         {
             "inputs": [
@@ -2304,3 +1654,5 @@ class ABIReference:
     collateral_repay_adapter_abi = [{"inputs":[{"internalType":"contract IPoolAddressesProvider","name":"addressesProvider","type":"address"},{"internalType":"contract IParaSwapAugustusRegistry","name":"augustusRegistry","type":"address"},{"internalType":"address","name":"owner","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"fromAsset","type":"address"},{"indexed":True,"internalType":"address","name":"toAsset","type":"address"},{"indexed":False,"internalType":"uint256","name":"amountSold","type":"uint256"},{"indexed":False,"internalType":"uint256","name":"receivedAmount","type":"uint256"}],"name":"Bought","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":True,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},{"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"fromAsset","type":"address"},{"indexed":True,"internalType":"address","name":"toAsset","type":"address"},{"indexed":False,"internalType":"uint256","name":"fromAmount","type":"uint256"},{"indexed":False,"internalType":"uint256","name":"receivedAmount","type":"uint256"}],"name":"Swapped","type":"event"},{"inputs":[],"name":"ADDRESSES_PROVIDER","outputs":[{"internalType":"contract IPoolAddressesProvider","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"AUGUSTUS_REGISTRY","outputs":[{"internalType":"contract IParaSwapAugustusRegistry","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"MAX_SLIPPAGE_PERCENT","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"ORACLE","outputs":[{"internalType":"contract IPriceOracleGetter","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"POOL","outputs":[{"internalType":"contract IPool","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"asset","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"uint256","name":"premium","type":"uint256"},{"internalType":"address","name":"initiator","type":"address"},{"internalType":"bytes","name":"params","type":"bytes"}],"name":"executeOperation","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"contract IERC20","name":"token","type":"address"}],"name":"rescueTokens","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"contract IERC20Detailed","name":"collateralAsset","type":"address"},{"internalType":"contract IERC20Detailed","name":"debtAsset","type":"address"},{"internalType":"uint256","name":"collateralAmount","type":"uint256"},{"internalType":"uint256","name":"debtRepayAmount","type":"uint256"},{"internalType":"uint256","name":"debtRateMode","type":"uint256"},{"internalType":"uint256","name":"buyAllBalanceOffset","type":"uint256"},{"internalType":"bytes","name":"paraswapData","type":"bytes"},{"components":[{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"uint256","name":"deadline","type":"uint256"},{"internalType":"uint8","name":"v","type":"uint8"},{"internalType":"bytes32","name":"r","type":"bytes32"},{"internalType":"bytes32","name":"s","type":"bytes32"}],"internalType":"struct BaseParaSwapAdapter.PermitSignature","name":"permitSignature","type":"tuple"}],"name":"swapAndRepay","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"}]
 
     token_transfer_proxy_abi = [{"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"previousOwner","type":"address"},{"indexed":True,"internalType":"address","name":"newOwner","type":"address"}],"name":"OwnershipTransferred","type":"event"},{"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"renounceOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"token","type":"address"},{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"transferFrom","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"transferOwnership","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+
+    wallet_balance_provide_abi = [{"inputs":[{"internalType":"address","name":"user","type":"address"},{"internalType":"address","name":"token","type":"address"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address[]","name":"users","type":"address[]"},{"internalType":"address[]","name":"tokens","type":"address[]"}],"name":"batchBalanceOf","outputs":[{"internalType":"uint256[]","name":"","type":"uint256[]"}],"stateMutability":"view","type":"function"},{"inputs":[{"internalType":"address","name":"provider","type":"address"},{"internalType":"address","name":"user","type":"address"}],"name":"getUserWalletBalances","outputs":[{"internalType":"address[]","name":"","type":"address[]"},{"internalType":"uint256[]","name":"","type":"uint256[]"}],"stateMutability":"view","type":"function"},{"stateMutability":"payable","type":"receive"}]
